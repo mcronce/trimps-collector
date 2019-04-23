@@ -1,0 +1,26 @@
+#!/bin/sh
+
+echo "${WEBDAV_URL}" "${WEBDAV_USERNAME}" "${WEBDAV_PASSWORD}" > /etc/davfs2/secrets;
+mount -t davfs "${WEBDAV_URL}" /remote;
+
+path="${1}";
+shift;
+
+remote_path="/remote/${path}";
+
+echo "--- Contents of ${remote_path}"; 
+ls -al "${remote_path}" | sed 's/^/	/';
+
+if [ "${MODE}" == 'json' ]; then
+	if [ -f "${remote_path}" ]; then
+		exec poll $@ "${remote_path}" 2>&1;
+	elif [ -d "${remote_path}" ]; then
+		cd "${remote_path}";
+		ls -1tr *.json.* | while read file; do
+			poll $@ --timestamp-in-filename "${file}" 2>&1 && mv -vf "${file}" processed/;
+		done
+	fi;
+else
+	exec poll $@ "${remote_path}" 2>&1;
+fi;
+
