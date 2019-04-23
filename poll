@@ -1,0 +1,332 @@
+#!/usr/local/bin/python3
+
+import argparse
+import json
+import os
+import shutil
+import socket
+import sys
+import tempfile
+import time
+
+import inflection
+import influxdb
+import lzstring
+import plyvel
+
+def mkpoint(measurement, tags, fields):
+	global global_tags
+	global now
+	return {
+		'measurement' : measurement,
+		'tags' : {**global_tags, **tags},
+		'time' : now,
+		'fields' : {k : (v if type(v) in [int, float, bool] else float(v)) for (k, v) in fields.items()}
+	}
+
+def time_since(event_time):
+	global now_ms
+	return float(now_ms - event_time) / 1000.0
+
+def per_hr(value, portal_time):
+	return (float(value) / time_since(portal_time)) * 3600.0
+
+cli = argparse.ArgumentParser()
+cli.add_argument('--influxdb-host', default = os.environ.get('INFLUXDB_HOST', None), help = 'InfluxDB host (env: INFLUXDB_HOST) (required)')
+cli.add_argument('--influxdb-port', type = int, default = os.environ.get('INFLUXDB_PORT', 8086), help = 'InfluxDB port (env: INFLUXDB_PORT) (default: 8086)')
+cli.add_argument('--influxdb-username', default = os.environ.get('INFLUXDB_USERNAME', 'root'), help = 'InfluxDB username (env: INFLUXDB_USERNAME) (default: root)')
+cli.add_argument('--influxdb-password', default = os.environ.get('INFLUXDB_PASSWORD', 'root'), help = 'InfluxDB password (env: INFLUXDB_PASSWORD) (default: root)')
+cli.add_argument('--influxdb-database', default = os.environ.get('INFLUXDB_DATABASE', 'example'), help = 'InfluxDB database (env: INFLUXDB_DATABASE) (default: example)')
+cli.add_argument('--timestamp-in-filename', action = 'store_true', default = os.environ.get('TIMESTAMP_IN_FILENAME', 'false').lower() != 'false', help = 'Attempt to parse a Unix timestamp out of the end of the filename (e.g. Trimps.json.1553164020) (env: TIMESTAMP_IN_FILENAME) (default: false)')
+cli.add_argument('--name', default = os.environ.get('NAME', None), help = 'Name for save file; if set, will be sent as a tag to InfluxDB (env: NAME)')
+cli.add_argument('--host', default = os.environ.get('HOST', socket.gethostname()), help = 'Override for host tag to send to InfluxDB; if not set, will default to the current hostname (env: HOST)')
+cli.add_argument('--mode', default = os.environ.get('MODE', 'leveldb'), help = 'Mode to run in, can be either "leveldb" or "json" (env: MODE) (default: leveldb)')
+cli.add_argument('--extract', default = os.environ.get('EXTRACT', None), help = 'Rather than generating metrics to send to InfluxDB, write the JSON save to this file (env: EXTRACT)')
+cli.add_argument('--verbose', action = 'store_true', default = os.environ.get('VERBOSE', 'false').lower() != 'false', help = 'Print more (env: VERBOSE) (default: false)') 
+cli.add_argument('path', default = None, help = 'Path to savefile; if mode is "leveldb", this should point to the LevelDB directory for your browser; if mode is "json", it should point directly to a JSON savefile (required)')
+
+(args, other_args) = cli.parse_known_args()
+arg_error = False
+if(args.path is None):
+	cli.print_usage()
+	sys.exit(1)
+
+now = None
+if(args.timestamp_in_filename):
+	now = int(int(args.path.split('.')[-1]) * 1e9) # Nanonsecond precision, for InfluxDB
+else:
+	now = int(time.time() * 1e9) # Nanosecond precision, for InfluxDB
+now_ms = int(now / 1e6) # Millisecond precision, stored in the savefile because Javascript
+
+global_tags = {'savename' : args.name} if args.name is not None else {}
+global_tags['host'] = args.host
+
+client = influxdb.InfluxDBClient(args.influxdb_host, args.influxdb_port, args.influxdb_username, args.influxdb_password, args.influxdb_database)
+data_points = []
+
+save = None
+if(args.mode == 'leveldb'):
+	tempdir = tempfile.mkdtemp()
+	if(args.verbose):
+		print('--- Using temp directory', tempdir)
+	shutil.copytree(args.path, tempdir + '/ldb')
+	os.remove(tempdir + '/ldb/LOCK')
+
+	db = plyvel.DB(tempdir + '/ldb')
+	save = db.get(b'_https://trimps.github.io\x00\x01trimpSave1')
+	db.close()
+	del db
+	shutil.rmtree(tempdir)
+	del tempdir
+
+	lz = lzstring.LZString()
+	save = json.loads(lz.decompressFromBase64(save[1:].decode('ascii')))
+	del lz
+elif(args.mode == 'json'):
+	with open(args.path, 'r') as f:
+		save = json.loads(f.read())
+else:
+	print('!!! Unknown mode "%s"' % (args.mode,))
+	sys.exit(1)
+
+if(args.extract is not None):
+	with open(args.extract + '.' + str(int(now / 1e9)), 'w') as f:
+		f.write(json.dumps(save, indent = 4))
+		f.write('\n')
+	sys.exit(0)
+
+save_global = save['global']
+data_points.append(mkpoint('trimps:runtime', {}, {
+	'version' : save_global['version']
+}))
+data_points.append(mkpoint('trimps:status', {}, {
+	'kill_saves_below' : save_global['killSavesBelow'],
+	'time_left_on_craft' : float(save_global['timeLeftOnCraft']),
+	'time_left_on_trap' : float(save_global['timeLeftOnTrap']),
+	'auto_craft_modifier' : float(save_global['autoCraftModifier']),
+	'time_this_run' : float(save_global['time']) / 1000.0,
+	'time_since_last_online' : time_since(save_global['lastOnline']),
+	'time_since_last_skeletimp' : time_since(save_global['lastSkeletimp']),
+	'current_helium' : float(save_global['heliumLeftover']),
+	'total_portals' : save_global['totalPortals'],
+	'total_gifts' : save_global['totalGifts'],
+	'best_helium' : float(save_global['bestHelium']),
+	'highest_helium_banked' : float(save_global['tempHighHelium']),
+	'total_helium_earned' : float(save_global['totalHeliumEarned']),
+	'time_since_last_unlock' : time_since(save_global['lastUnlock']),
+	'auto_prestiges' : save_global['autoPrestiges'],
+	'last_portal_at_zone' : save_global['lastPortal'],
+	'golden_upgrades' : save_global['goldenUpgrades'],
+	'daily_challenge_helium' : save_global['dailyHelium'],
+	'challenge_squared_reward' : save_global['totalSquaredReward'],
+	'spires_completed' : save_global['spiresCompleted'],
+	'tokens_this_run' : save_global['runTokens'],
+	'tokens_best_run' : save_global['bestTokens'],
+	'one_off_achievements' : len([True for finished in save['achievements']['oneOffs']['finished'] if finished == True]),
+	'time_since_last_portal' : time_since(save_global['portalTime'])
+}))
+data_points.append(mkpoint('trimps:world', {}, {
+	'world' : save_global['world'],
+	'current_world_size' : len(save_global['gridArray']),
+	'current_map_size' : len(save_global['mapGridArray']),
+	'owned_maps' : save_global['mapsOwned'],
+	'earned_maps' : save_global['totalMapsEarned'],
+	'last_cleared_cell' : save_global['lastClearedCell'],
+	'last_cleared_map_cell' : save_global['lastClearedMapCell'],
+	'highest_level_cleared' : save_global['highestLevelCleared'],
+	'prison_clear' : save_global['prisonClear'],
+	'total_void_maps' : save_global['totalVoidMaps'],
+	'void_max_level' : save_global['voidMaxLevel'],
+	'spire_active' : save_global['spireActive'],
+	'spire_deaths' : save_global['spireDeaths'],
+	'spire_rows' : save_global['spireRows'],
+	'void_deaths' : save_global['voidDeaths'],
+	'sugar_rush' : save_global['sugarRush']
+}))
+data_points.append(mkpoint('trimps:player', {}, {
+	'modifier' : save_global['playerModifier'],
+	'turkimp_timer' : save_global['turkimpTimer'],
+	'nullifium' : save_global['nullifium'],
+	'max_carried_heirlooms' : save_global['maxCarriedHeirlooms']
+}))
+data_points.append(mkpoint('trimps:combat', {}, {
+	'paused' : save_global['pauseFight'],
+	'soldier_health' : float(save_global['soldierHealth']),
+	'soldier_health_max' : float(save_global['soldierHealthMax']),
+	'soldier_health_remaining' : float(save_global['soldierHealthRemaining']),
+	'soldier_current_attack' : float(save_global['soldierCurrentAttack']),
+	'soldier_current_block' : float(save_global['soldierCurrentBlock']),
+	'fighting' : save_global['fighting'],
+	'health' : float(save_global['health']),
+	'attack' : float(save_global['attack']),
+	'block' : float(save_global['block']),
+	'auto_battle' : save_global['autoBattle'],
+	'battle_counter' : float(save_global['battleCounter']),
+	'fresh_fight' : save_global['freshFight'],
+	'titimps_left' : save_global['titimpLeft'],
+	'map_bonus' : save_global['mapBonus'],
+	'achievement_bonus' : float(save_global['achievementBonus']),
+	'time_since_zone_started' : time_since(save_global['zoneStarted']),
+	'time_since_map_started' : time_since(save_global['mapStarted']),
+	'use_shriek' : save_global['useShriek'],
+	'using_shriek' : save_global['usingShriek'],
+	'soldiers' : save_global['maxSoldiersAtStart'],
+	'time_since_last_soldiers_sent' : time_since(save_global['lastSoldierSentAt'])
+}))
+data_points.append(mkpoint('trimps:unlockflags', {}, {
+	'maps_active' : save_global['mapsActive'],
+	'pre_maps_active' : save_global['preMapsActive'],
+	'switch_to_maps' : save_global['switchToMaps'],
+	'switch_to_world' : save_global['switchToWorld'],
+	'broken_planet' : save_global['brokenPlanet'],
+	'frugal_done' : save_global['frugalDone'],
+	'slow_done' : save_global['slowDone'],
+	'auto_upgrades' : save_global['autoUpgradesAvailable'],
+	'auto_storage' : save_global['autoStorageAvailable'],
+	'geneticist_assist' : save_global['Geneticistassist'],
+	'decay_done' : save_global['decayDone'],
+	'can_magma' : save_global['canMagma'],
+	'improved_auto_storage' : save_global['improvedAutoStorage'],
+	'auto_golden' : save_global['autoGolden']
+}))
+data_points.append(mkpoint('trimps:trimps', {}, {
+	'last_breed_time' : save_global['lastBreedTime'],
+	'anticipation' : save_global['antiStacks'],
+	'lowest_gen' : save_global['lowestGen'],
+	'breed_back' : save_global['breedBack'],
+	'bionic_owned' : save_global['bionicOwned'],
+	'robotrimp_level' : save_global['roboTrimpLevel'],
+	'robotrimp_cooldown' : save_global['roboTrimpCooldown'],
+	'breed_time' : save_global['breedTime'],
+	'real_breed_time' : save_global['realBreedTime'],
+	'fluffy_exp' : save_global['fluffyExp'],
+	'fluffy_prestige' : save_global['fluffyPrestige'],
+	'fluffy_exp_this_run' : save_global['runFluffyExp'],
+	'fluffy_exp_best_run' : save_global['bestFluffyExp']
+}))
+data_points.append(mkpoint('trimps:resource', {'name' : 'essence'}, {
+	'owned' : float(save_global['essence']),
+	'owned_per_hr' : per_hr(save_global['essence'], save_global['portalTime']),
+	'spent' : int(save_global['spentEssence'])
+}))
+data_points.append(mkpoint('trimps:resource', {'name' : 'magmite'}, {
+	'owned' : float(save_global['magmite']),
+	'owned_per_hr' : per_hr(save_global['magmite'], save_global['portalTime']),
+}))
+data_points.append(mkpoint('trimps:resource', {'name' : 'magma_fuel'}, {
+	'owned' : float(save_global['magmaFuel']),
+	'owned_per_hr' : per_hr(save_global['magmaFuel'], save_global['portalTime']),
+}))
+data_points.append(mkpoint('trimps:resource', {'name' : 'bones'}, {
+	'owned' : float(save_global['b'])
+}))
+
+for (resource, stats) in save_global['lootAvgs'].items():
+	data_points.append(mkpoint('trimps:resource_loot_avg', {'resource' : resource}, stats))
+
+for (element, stats) in save['empowerments'].items():
+	data_points.append(mkpoint('trimps:empowerment', {'element' : element.lower()}, {inflection.underscore(k) : v for (k, v) in stats.items()}))
+
+data_points.append(mkpoint('trimps:single_run_bonuses', {}, {inflection.underscore(k) : v['owned'] for (k, v) in save['singleRunBonuses'].items()}))
+
+for (talent, stats) in save['talents'].items():
+	data_points.append(mkpoint('trimps:talent', {'name' : inflection.underscore(talent)}, {inflection.underscore(k) : v for (k, v) in stats.items()}))
+
+for (perk, stats) in save['portal'].items():
+	if('locked' not in stats):
+		stats['locked'] = False
+	if(type(stats['locked']) != bool):
+		stats['locked'] = bool(stats['locked'])
+	data_points.append(mkpoint('trimps:perk', {'name' : perk}, {inflection.underscore(k) : v for (k, v) in stats.items() if k in ['level', 'locked', 'heliumSpent', 'max']}))
+
+for (k, v) in save['c2'].items():
+	data_points.append(mkpoint('trimps:challenge_squared', {'challenge' : k}, {'highest_zone' : v}))
+
+for (name, stats) in save['stats'].items():
+	if(len(stats) != 0):
+		data_points.append(mkpoint('trimps:stat', {'name' : inflection.underscore(name)}, {inflection.underscore(k) : v for (k, v) in stats.items() if k in ['value', 'valueTotal', 'storedValue', 'atZone']}))
+
+for (name, stats) in save['generatorUpgrades'].items():
+	data_points.append(mkpoint('trimps:generator_upgrade', {'upgrade' : name}, stats))
+
+data_points.append(mkpoint('trimps:permanent_generator_upgrade', {}, {k : v['owned'] for (k, v) in save['permanentGeneratorUpgrades'].items()}))
+
+for (category, stats) in save['achievements'].items():
+	if(category != 'oneOffs'):
+		if('earnable' not in stats):
+			stats['earnable'] = True
+		data_points.append(mkpoint('trimps:achievement', {'category' : category}, {inflection.underscore(k) : v for (k, v) in stats.items() if k in ['finished', 'highest', 'earnable', 'lastZone']}))
+
+for (resource, stats) in save['resources'].items():
+	if('owned' in stats):
+		stats['owned_per_hr'] = per_hr(stats['owned'], save_global['portalTime'])
+	data_points.append(mkpoint('trimps:resource', {'name' : resource}, {inflection.underscore(k) : (float(v) if k in ['potency', 'owned', 'owned_per_hr'] else int(v)) for (k, v) in stats.items() if k in ['owned', 'owned_per_hr', 'max', 'working', 'speed', 'soldiers', 'maxSoldiers', 'potency'] and v != -1}))
+
+for (name, stats) in save['equipment'].items():
+	if(name == 'Shield'):
+		if('blockNow' in stats and stats['blockNow']):
+			del stats['health']
+			del stats['healthCalculated']
+		else:
+			del stats['block']
+			del stats['blockCalculated']
+	data_points.append(mkpoint('trimps:equipment', {'name' : name}, {inflection.underscore(k) : 0 if stats['locked'] else (float(v) if k == 'block' else v) for (k, v) in stats.items() if k in ['modifier', 'level', 'oc', 'prestige', 'health', 'attack', 'block', 'healthCalculated', 'attackCalculated', 'blockCalculated']}))
+
+for (name, stats) in save['buildings'].items():
+	fields = {inflection.underscore(k) : v for (k, v) in stats.items() if k in ['locked', 'owned', 'purchased', 'craftTime']}
+	if('increase' in stats):
+		fields['increase:' + stats['increase']['what']] = stats['increase']['by']
+	data_points.append(mkpoint('trimps:building', {'name' : name}, fields))
+
+for (name, stats) in save['jobs'].items():
+	data_points.append(mkpoint('trimps:job', {'name' : name}, {inflection.underscore(k) : v for (k, v) in stats.items() if k in ['locked', 'owned', 'modifier', 'populationModifier', 'healthModifier', 'damageModifier']}))
+
+for (name, stats) in save['goldenUpgrades'].items():
+	data_points.append(mkpoint('trimps:golden_upgrade', {'name' : name}, {'current_bonus' : float(stats['currentBonus'])}))
+
+for (name, stats) in save['upgrades'].items():
+	data_points.append(mkpoint('trimps:upgrade', {'name' : name}, {
+		'locked' : bool(stats['locked'] and ((stats['allowed'] == 0) or (stats['done'] != stats['allowed']))),
+		'done' : stats['done'] if 'done' in stats else 0,
+		'allowed' : stats['allowed']
+	}))
+
+for (name, stats) in save['triggers'].items():
+	data_points.append(mkpoint('trimps:trigger', {'name' : name}, {'done' : stats['done']}))
+
+for (name, unlocked) in save['unlocks']['imps'].items():
+	fields = {
+		'unlocked' : unlocked,
+		'count' : save['unlocks']['impCount'][name]
+	}
+	if((name + 'Added') in save['unlocks']['impCount']):
+		fields['added'] = save['unlocks']['impCount'][name + 'Added']
+	data_points.append(mkpoint('trimps:unlock', {'type' : 'imp', 'name' : name}, fields))
+
+save_spire_main = save['playerSpire']['main']
+data_points.append(mkpoint('trimps:spire', {}, {
+	'rows_allowed' : save_spire_main['rowsAllowed'],
+	'runestones' : save_spire_main['runestones'],
+	'spirestones' : save_spire_main['spirestones'],
+	'max_enemies' : save_spire_main['maxEnemies'],
+	'current_enemies' : save_spire_main['currentEnemies'],
+	'enemies_killed' : save_spire_main['enemiesKilled'],
+	'escapees' : save_spire_main['escapees'],
+	'ticks_since_last_enemy' : save_spire_main['ticksSinceLastEnemy'],
+	'initialized' : save_spire_main['initialized'],
+	'difficulty' : save_spire_main['difficulty'],
+	'loot_avg_accumulator' : save_spire_main['lootAvg']['accumulator'],
+	'loot_avg_average' : save_spire_main['lootAvg']['average'],
+	'loot_avg_counter' : save_spire_main['lootAvg']['counter'],
+	'killed_since_leak' : save_spire_main['killedSinceLeak'],
+	'spent_on_upgrades' : save_spire_main['spentOnUpgrades'],
+	'peak_threat' : save_spire_main['peakThreat']
+}))
+
+for (name, stats) in save['playerSpire']['traps'].items():
+	data_points.append(mkpoint('trimps:spire:trap', {'name' : name}, stats))
+
+if(args.verbose):
+	print(influxdb.line_protocol.make_lines({'points' : data_points}))
+client.write_points(data_points)
+
