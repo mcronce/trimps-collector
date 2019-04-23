@@ -1,0 +1,16 @@
+**/*~
+**/.*.sw*
+.git*
+.*ignore
+*file
+*file.*
+
+**/*.egg-info
+**/__pycache__
+
+dist
+build
+test
+example
+data
+
