@@ -1,0 +1,16 @@
+#!/bin/sh
+
+echo "${WEBDAV_URL}" "${WEBDAV_USERNAME}" "${WEBDAV_PASSWORD}" > /etc/davfs2/secrets;
+mount -t davfs "${WEBDAV_URL}" /remote;
+
+path="${1}";
+shift;
+
+remote_path="/remote/${path}";
+
+cd "${remote_path}";
+mkdir -pv 'archived';
+ls -1tr *.json.* | sed 's/^\(.*\.json\)\..*$/\1/' | sort | uniq | while read template; do
+	tar -cjvf "archived/${template}.tar.bz2.$(date +%s)" "${template}".* && rm -Rvf "${template}".*;
+done;
+
